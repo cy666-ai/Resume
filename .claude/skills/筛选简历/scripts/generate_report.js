@@ -2,6 +2,27 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// =====================================================
+// 性能追踪器
+// =====================================================
+class PerfTracker {
+    constructor() { this.phases = []; this.current = null; this.globalStart = Date.now(); }
+    start(name) {
+        if (this.current) this.end();
+        this.current = { name, start: Date.now(), details: [] };
+    }
+    detail(label, ms) { if (this.current) this.current.details.push({ label, ms }); }
+    end() {
+        if (this.current) {
+            this.current.ms = Date.now() - this.current.start;
+            this.phases.push(this.current);
+            this.current = null;
+        }
+    }
+    totalMs() { return Date.now() - this.globalStart; }
+}
+const perf = new PerfTracker();
+
 // 获取当前时间戳
 const now = new Date();
 const timestamp = now.getFullYear().toString() +
@@ -1329,7 +1350,9 @@ function buildCandidateAnalyses(groups) {
             if (c.totalScore === undefined || c.totalScore === null) {
                 // 尝试从 PDF 解析
                 if (c.filePath && fs.existsSync(c.filePath)) {
+                    const t0 = Date.now();
                     const pdfResult = analyzeResumeFromPdf(c.filePath, c.name, c.experience, posSkills);
+                    if (perf.current && perf.current.name === 'AI匹配分析') perf.detail(c.name, Date.now() - t0);
                     Object.assign(c, pdfResult);
                     c.recommendation = c.totalScore >= 80 ? '推荐' : c.totalScore >= 70 ? '需面试确认' : '待定';
                     if (c.totalScore >= 80) c.recommendation = '推荐';
@@ -1610,6 +1633,114 @@ function generateGroupedReport(groups) {
 }
 
 // =====================================================
+// 性能测试报告
+// =====================================================
+function formatDuration(ms) {
+    if (ms < 1000) return `${ms}ms`;
+    if (ms < 60000) return `${(ms / 1000).toFixed(2)}s`;
+    const minutes = Math.floor(ms / 60000);
+    const seconds = ((ms % 60000) / 1000).toFixed(1);
+    return `${minutes}m ${seconds}s`;
+}
+
+function collectPerfDetails(perfTracker, phaseName) {
+    const phase = perfTracker.phases.find(p => p.name === phaseName);
+    return phase && Array.isArray(phase.details) ? phase.details : [];
+}
+
+function buildPerfSuggestions(perfTracker, candidateCount) {
+    const total = perfTracker.phases.reduce((sum, p) => sum + p.ms, 0);
+    const suggestions = [];
+    const phaseMap = Object.fromEntries(perfTracker.phases.map(p => [p.name, p]));
+    const aiDetails = collectPerfDetails(perfTracker, 'AI匹配分析');
+    const poolDetails = collectPerfDetails(perfTracker, '人才库查重');
+    const avgAi = aiDetails.length ? aiDetails.reduce((s, d) => s + d.ms, 0) / aiDetails.length : 0;
+    const avgPool = poolDetails.length ? poolDetails.reduce((s, d) => s + d.ms, 0) / poolDetails.length : 0;
+
+    if (total > 5 * 60 * 1000) {
+        suggestions.push('总耗时超过 5 分钟，建议优先考虑将 PDF 解析、OCR 和人才库查重改为并行处理。');
+    }
+    if (avgAi > 5000) {
+        suggestions.push(`AI匹配分析平均每份 ${formatDuration(Math.round(avgAi))}，建议检查 pdftotext/OCR 是否命中兜底流程，并尽量避免重复解析同一份 PDF。`);
+    }
+    if (avgPool > 3000) {
+        suggestions.push(`人才库查重平均每人 ${formatDuration(Math.round(avgPool))}，建议检查 lark-cli 网络耗时，或改造为批量查询接口以减少逐人请求。`);
+    }
+    if (phaseMap['提取学校信息'] && total > 0 && phaseMap['提取学校信息'].ms / total > 0.25) {
+        suggestions.push('学校信息提取耗时占比较高，建议预先维护 skills_config.json 的 candidateSchools，减少每次筛选时重复解析 PDF。');
+    }
+    if (phaseMap['人才库查重'] && total > 0 && phaseMap['人才库查重'].ms / total > 0.4) {
+        suggestions.push('人才库查重是主要瓶颈，优先优化飞书接口调用次数、超时时间和失败重试策略。');
+    }
+    if (phaseMap['AI匹配分析'] && total > 0 && phaseMap['AI匹配分析'].ms / total > 0.4) {
+        suggestions.push('AI匹配分析是主要瓶颈，建议缓存 PDF 文本提取结果，避免学校提取和评分阶段重复调用 pdftotext/OCR。');
+    }
+    if (candidateCount > 20) {
+        suggestions.push('本次简历数量较多，建议后续按岗位或批次分组处理，降低单次运行失败后的返工成本。');
+    }
+    if (suggestions.length === 0) {
+        suggestions.push('本次各阶段耗时分布正常，暂未发现明显性能瓶颈。');
+    }
+    return suggestions;
+}
+
+function generatePerfReport(perfTracker, candidateCount, archiveRoot) {
+    if (perfTracker.current) perfTracker.end();
+    const phases = perfTracker.phases;
+    const total = phases.reduce((sum, p) => sum + p.ms, 0);
+    const lines = [];
+
+    lines.push('# 筛选简历性能测试报告');
+    lines.push('');
+    lines.push(`- 生成时间：${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`);
+    lines.push(`- 简历数量：${candidateCount} 份`);
+    lines.push(`- 总耗时：${formatDuration(total)}`);
+    lines.push(`- 平均每份：${candidateCount > 0 ? formatDuration(Math.round(total / candidateCount)) : '无简历'}`);
+    lines.push('');
+
+    lines.push('## 阶段耗时');
+    lines.push('');
+    lines.push('| 阶段 | 耗时 | 占比 | 耗时条 |');
+    lines.push('|---|---:|---:|---|');
+    phases.forEach(phase => {
+        const pct = total > 0 ? phase.ms / total : 0;
+        const bar = '█'.repeat(Math.max(1, Math.round(pct * 20)));
+        lines.push(`| ${phase.name} | ${formatDuration(phase.ms)} | ${(pct * 100).toFixed(1)}% | ${bar} |`);
+    });
+    lines.push('');
+
+    const detailPhases = phases.filter(p => p.details && p.details.length > 0);
+    if (detailPhases.length > 0) {
+        lines.push('## 候选人级别耗时明细');
+        lines.push('');
+        detailPhases.forEach(phase => {
+            lines.push(`### ${phase.name}`);
+            lines.push('');
+            lines.push('| 候选人 | 耗时 |');
+            lines.push('|---|---:|');
+            phase.details
+                .slice()
+                .sort((a, b) => b.ms - a.ms)
+                .forEach(d => lines.push(`| ${d.label} | ${formatDuration(d.ms)} |`));
+            lines.push('');
+        });
+    }
+
+    lines.push('## 改进建议');
+    lines.push('');
+    buildPerfSuggestions(perfTracker, candidateCount).forEach((suggestion, idx) => {
+        lines.push(`${idx + 1}. ${suggestion}`);
+    });
+    lines.push('');
+
+    const filename = `性能测试报告_${timestamp}.md`;
+    const filepath = path.join(archiveRoot, filename);
+    fs.mkdirSync(archiveRoot, { recursive: true });
+    fs.writeFileSync(filepath, lines.join('\n'), 'utf8');
+    return filepath;
+}
+
+// =====================================================
 // 步骤6：按评分和岗位分类简历文件到本次筛选归档文件夹
 // 结构：简历/筛选结果_{YYYYMMDD}/{合格/不合格}/{岗位名}/{候选人简历.pdf}
 // =====================================================
@@ -1794,18 +1925,25 @@ function main() {
         : path.join(SKILL_ROOT, 'references', '岗位.md');
     const archiveRoot = path.join(resumeDir, `筛选结果_${dateStr}`);
 
+    perf.start('扫描简历文件');
     console.log('📂 扫描“简历”目录根层级中的简历文件...');
     const resumes = scanResumes(resumeDir);
     console.log(`   找到 ${resumes.length} 份简历`);
     console.log(`   归档目录：${archiveRoot}\n`);
+    perf.end();
     if (resumes.length === 0) {
-        console.log('⚠️  未在”简历”目录根层级找到简历文件（PDF/JPG），请将待筛选简历放到该目录后重试。');
+        console.log('⚠️  未在“简历”目录根层级找到简历文件（PDF/JPG），请将待筛选简历放到该目录后重试。');
+        const perfReportPath = generatePerfReport(perf, 0, archiveRoot);
+        console.log(`⏱️  性能测试报告已生成：${perfReportPath}`);
         return;
     }
 
     // ---- 批量提取学校信息并更新配置文件 ----
+    perf.start('提取学校信息');
     const updatedSchools = collectAndUpdateSchools(resumes, CONFIG_PATH);
+    perf.end();
 
+    perf.start('解析岗位要求');
     console.log('\n📋 解析岗位要求...');
     const positions = parsePositionRequirements(mdPath);
     console.log(`   找到 ${Object.keys(positions).length} 个岗位`);
@@ -1813,7 +1951,9 @@ function main() {
         console.log(`   - ${key} (${positions[key].requirements.length}项要求)`);
     });
     console.log();
+    perf.end();
 
+    perf.start('按岗位分组');
     console.log('📊 按岗位分组...');
     const groups = groupByPosition(resumes, positions);
     Object.keys(groups).forEach(key => {
@@ -1823,18 +1963,24 @@ function main() {
         });
     });
     console.log();
+    perf.end();
 
+    perf.start('AI匹配分析');
     console.log('🤖 AI匹配分析...');
     const analyzedGroups = buildCandidateAnalyses(groups);
     console.log('   分析完成\n');
+    perf.end();
 
     // ---- 人才库查重 ----
+    perf.start('人才库查重');
     console.log('🔎 人才库查重...');
     let inPoolCount = 0, notInPoolCount = 0, poolUnknownCount = 0;
     Object.keys(analyzedGroups).forEach(key => {
         const group = analyzedGroups[key];
         group.candidates.forEach(c => {
+            const t0 = Date.now();
             c.talentPool = checkTalentPool(c);
+            perf.detail(c.name, Date.now() - t0);
             if (c.talentPool.inPool) inPoolCount++;
             else if (['error', 'no_contact'].includes(c.talentPool.status)) poolUnknownCount++;
             else notInPoolCount++;
@@ -1842,8 +1988,10 @@ function main() {
         });
     });
     console.log(`   已进入人才库 ${inPoolCount} 人，未进入 ${notInPoolCount} 人，未确认 ${poolUnknownCount} 人\n`);
+    perf.end();
 
     // ---- 学历校验 ----
+    perf.start('学历校验');
     console.log('🎓 学历校验...');
     let passCount = 0, failCount = 0;
     Object.keys(analyzedGroups).forEach(key => {
@@ -1859,7 +2007,9 @@ function main() {
         });
     });
     console.log(`   通过 ${passCount} 人，未通过 ${failCount} 人\n`);
+    perf.end();
 
+    perf.start('生成报告');
     console.log('📝 生成报告...');
     const tierSummary = getTierSummary(analyzedGroups);
     fs.mkdirSync(archiveRoot, { recursive: true });
@@ -1875,6 +2025,7 @@ function main() {
     }
     console.log(`   筛选统计：已进入人才库 ${tierSummary.inTalentPool} 份，合格 ${tierSummary.pass} 份，不合格 ${tierSummary.fail} 份`);
     console.log();
+    perf.end();
 
     // 输出摘要
     console.log('='.repeat(50));
@@ -1890,16 +2041,17 @@ function main() {
         });
     });
 
-    // ---- 记录已投简历名单 ----
+    // ---- 记录已投简历名单 + 简历分类归档 ----
+    perf.start('简历归档');
     const deliveredListPath = path.join(PROJECT_ROOT, '已投简历名单.md');
     appendDeliveredResumeList(analyzedGroups, deliveredListPath);
     console.log(`🗂️  已追加筛选记录：${deliveredListPath}`);
 
-    // ---- 简历分类归档 ----
     console.log(`\n${'='.repeat(50)}`);
     console.log('📁 分类简历文件（合格/不合格 + 已进入人才库）...');
     console.log('='.repeat(50));
     const result = classifyResumesByScore(analyzedGroups, resumeDir, archiveRoot);
+    perf.end();
 
     // 展示各等级各岗位的分布
     console.log(`\n📂 ${path.relative(__dirname, result.tierDirs.pass)}/ → 每个岗位一个子文件夹`);
@@ -1926,6 +2078,9 @@ function main() {
     if (result.moved.skipped > 0) {
         console.log(`\n   ⚠️  跳过 ${result.moved.skipped} 份（移动失败）`);
     }
+
+    const perfReportPath = generatePerfReport(perf, resumes.length, archiveRoot);
+    console.log(`\n⏱️  性能测试报告已生成：${perfReportPath}`);
     console.log('\n✅ 全部完成！');
 }
 
